@@ -1,14 +1,25 @@
 #include "louds-trie.hpp"
 
-#ifdef _MSC_VER
- #include <intrin.h>
- #include <immintrin.h>
-#else  // _MSC_VER
- #include <x86intrin.h>
-#endif  // _MSC_VER
-
 #include <cassert>
 #include <vector>
+
+// Platform detection and intrinsic includes
+#if defined(_MSC_VER)
+ #include <intrin.h>
+ #if defined(_M_X64) || defined(_M_IX86)
+  #include <immintrin.h>
+  #define HAS_PDEP 1
+ #endif
+#elif defined(__GNUC__) || defined(__clang__)
+ #if defined(__x86_64__) || defined(__i386__)
+  #include <x86intrin.h>
+  #define HAS_PDEP 1
+ #endif
+#endif
+
+#ifndef HAS_PDEP
+ #define HAS_PDEP 0
+#endif
 
 namespace louds {
 namespace {
@@ -27,6 +38,25 @@ uint64_t Ctz(uint64_t x) {
 #else  // _MSC_VER
   return __builtin_ctzll(x);
 #endif  // _MSC_VER
+}
+
+// Portable implementation of _pdep_u64 for non-x86 architectures
+uint64_t Pdep(uint64_t src, uint64_t mask) {
+#if HAS_PDEP
+  return _pdep_u64(src, mask);
+#else
+  // Portable implementation using bit manipulation
+  uint64_t result = 0;
+  while (mask != 0) {
+    uint64_t mask_bit = mask & -mask;  // Extract lowest set bit
+    if (src & 1) {
+      result |= mask_bit;
+    }
+    src >>= 1;
+    mask ^= mask_bit;  // Clear the bit we just processed
+  }
+  return result;
+#endif
 }
 
 struct BitVector {
@@ -153,7 +183,7 @@ struct BitVector {
       word_id += 3;
       i -= ranks[rank_id].rels[2];
     }
-    return (word_id * 64) + Ctz(_pdep_u64(1UL << i, words[word_id]));
+    return (word_id * 64) + Ctz(Pdep(1UL << i, words[word_id]));
   }
 
   uint64_t size() const {
@@ -188,6 +218,8 @@ class TrieImpl {
   void add(const string &key);
   void build();
   int64_t lookup(const string &query) const;
+  
+  static TrieImpl* merge(const TrieImpl& trie1, const TrieImpl& trie2);
 
   uint64_t n_keys() const {
     return n_keys_;
@@ -198,6 +230,14 @@ class TrieImpl {
   uint64_t size() const {
     return size_;
   }
+  
+  // struct for child range
+  struct ChildRange {
+    uint64_t begin;  
+    uint64_t end;    
+  };
+  
+  ChildRange get_child_range(uint64_t depth, uint64_t node_id) const;
 
  private:
   vector<Level> levels_;
@@ -205,6 +245,8 @@ class TrieImpl {
   uint64_t n_nodes_;
   uint64_t size_;
   string last_key_;
+  
+  friend class Trie;
 };
 
 TrieImpl::TrieImpl()
@@ -357,6 +399,203 @@ uint64_t Trie::n_nodes() const {
 
 uint64_t Trie::size() const {
   return impl_->size();
+}
+
+// get_child_range helper
+TrieImpl::ChildRange TrieImpl::get_child_range(uint64_t depth, uint64_t node_id) const {
+  if (depth >= levels_.size()) {
+    return {0, 0};
+  }
+  
+  const Level& level = levels_[depth];
+  
+  // find start
+  uint64_t run_start;
+  if (node_id != 0) {
+    run_start = level.louds.select(node_id - 1) + 1;
+  } else {
+    run_start = 0;
+  }
+  
+  // find end 
+  uint64_t run_end = run_start;
+  uint64_t word = level.louds.words[run_end / 64] >> (run_end % 64);
+  if (word == 0) {
+    run_end += 64 - (run_end % 64);
+    word = level.louds.words[run_end / 64];
+    while (word == 0) {
+      run_end += 64;
+      word = level.louds.words[run_end / 64];
+    }
+  }
+  run_end += Ctz(word);
+  
+  uint64_t begin = run_start - node_id;  
+  uint64_t end = begin + (run_end - run_start);  
+  
+  return {begin, end};
+}
+
+// merge function 
+TrieImpl* TrieImpl::merge(const TrieImpl& trie1, const TrieImpl& trie2) {
+  TrieImpl* merged = new TrieImpl();
+  
+  merged->levels_.clear();
+  merged->n_nodes_ = 0;
+  merged->n_keys_ = 0;
+  
+  size_t max_depth = std::max(trie1.levels_.size(), trie2.levels_.size());
+  merged->levels_.resize(max_depth);
+  
+  // struct to store both node
+  struct NodePair {
+    uint64_t node1;
+    uint64_t node2;
+    bool has1;
+    bool has2;
+  };
+  
+  vector<vector<NodePair>> queue(max_depth);
+  queue[0].push_back({0, 0, true, true});
+  
+  // root level
+  merged->levels_[0].louds.add(0);
+  merged->levels_[0].louds.add(1);
+  merged->levels_[0].labels.push_back(' ');
+  merged->n_nodes_ = 1;
+  
+  // go through each level
+  for (size_t depth = 0; depth < max_depth - 1; ++depth) {
+    if (queue[depth].empty()) continue;
+    
+    Level& next_level = merged->levels_[depth + 1];
+    
+    // iterate all the parent node
+    for (const NodePair& parent_pair : queue[depth]) {
+      if (!parent_pair.has1 && !parent_pair.has2) continue;
+      
+      ChildRange range1 = {0, 0};
+      ChildRange range2 = {0, 0};
+      
+      if (parent_pair.has1 && depth + 1 < trie1.levels_.size()) {
+        range1 = trie1.get_child_range(depth + 1, parent_pair.node1);
+      }
+      if (parent_pair.has2 && depth + 1 < trie2.levels_.size()) {
+        range2 = trie2.get_child_range(depth + 1, parent_pair.node2);
+      }
+      
+      uint64_t i1 = range1.begin;
+      uint64_t i2 = range2.begin;
+      
+      while (i1 < range1.end || i2 < range2.end) {
+        uint8_t label1;
+        if (i1 < range1.end && depth + 1 < trie1.levels_.size()) {
+          label1 = trie1.levels_[depth + 1].labels[i1];
+        } else {
+          label1 = 255;
+        }
+        
+        uint8_t label2;
+        if (i2 < range2.end && depth + 1 < trie2.levels_.size()) {
+          label2 = trie2.levels_[depth + 1].labels[i2];
+        } else {
+          label2 = 255;
+        }
+        
+        bool has1 = (i1 < range1.end);
+        bool has2 = (i2 < range2.end);
+        
+        if (has1 && has2 && label1 == label2) {
+          // same label in both
+          next_level.louds.add(0); 
+          next_level.labels.push_back(label1);
+          
+          // take the or of terminal bit
+          bool term1 = trie1.levels_[depth + 1].outs.get(i1);
+          bool term2 = trie2.levels_[depth + 1].outs.get(i2);
+          if (term1 || term2) {
+            next_level.outs.add(1);
+          } else {
+            next_level.outs.add(0);
+          }
+          
+          if (term1 || term2) {
+            merged->n_keys_++;
+            next_level.offset++;
+          }
+          
+          // add to the queue for next level
+          if (depth + 2 < max_depth) {
+            queue[depth + 1].push_back({i1, i2, true, true});
+          }
+          
+          i1++;
+          i2++;
+        } else if (!has2 || (has1 && label1 < label2)) {
+          // take trie1
+          next_level.louds.add(0);
+          next_level.labels.push_back(label1);
+          
+          bool term1 = trie1.levels_[depth + 1].outs.get(i1);
+          if (term1) {
+            next_level.outs.add(1);
+          } else {
+            next_level.outs.add(0);
+          }
+          
+          if (term1) {
+            merged->n_keys_++;
+            next_level.offset++;
+          }
+          
+          if (depth + 2 < max_depth) {
+            queue[depth + 1].push_back({i1, 0, true, false});
+          }
+          
+          i1++;
+        } else {
+          // take trie2
+          next_level.louds.add(0);
+          next_level.labels.push_back(label2);
+          
+          bool term2 = trie2.levels_[depth + 1].outs.get(i2);
+          if (term2) {
+            next_level.outs.add(1);
+          } else {
+            next_level.outs.add(0);
+          }
+          
+          if (term2) {
+            merged->n_keys_++;
+            next_level.offset++;
+          }
+          
+          // Enqueue child from trie2 only
+          if (depth + 2 < max_depth) {
+            queue[depth + 1].push_back({0, i2, false, true});
+          }
+          
+          i2++;
+        }
+        
+        merged->n_nodes_++;
+      }
+      
+      // add run terminator
+      next_level.louds.add(1);
+    }
+  }
+  
+  merged->build();
+  
+  return merged;
+}
+
+Trie* Trie::merge_trie(const Trie& trie1, const Trie& trie2) {
+  Trie* merged = new Trie();
+  delete merged->impl_;
+  merged->impl_ = TrieImpl::merge(*trie1.impl_, *trie2.impl_);
+  return merged;
 }
 
 }  // namespace louds

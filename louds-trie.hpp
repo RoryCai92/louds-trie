@@ -29,6 +29,10 @@ class Trie {
   uint64_t n_nodes() const;
   // size returns the approximate size of assigned memory.
   uint64_t size() const;
+  
+  // merge_trie merges two tries into a new trie.
+  // Returns a new Trie containing all keys from both input tries.
+  static Trie* merge_trie(const Trie& trie1, const Trie& trie2);
 
  private:
   TrieImpl *impl_;

@@ -2,6 +2,7 @@
 #include <cassert>
 #include <chrono>
 #include <iostream>
+#include <random>
 #include <vector>
 
 #include "louds-trie.hpp"
@@ -46,7 +47,9 @@ int main() {
     assert(ids[i] == i);
   }
 
-  random_shuffle(keys.begin(), keys.end());
+  random_device rd;
+  mt19937 g(rd());
+  shuffle(keys.begin(), keys.end(), g);
 
   begin = high_resolution_clock::now();
   for (uint64_t i = 0; i < keys.size(); ++i) {
